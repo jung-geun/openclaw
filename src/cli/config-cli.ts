@@ -1,12 +1,12 @@
 import type { Command } from "commander";
 import JSON5 from "json5";
+import { OLLAMA_DEFAULT_BASE_URL } from "../agents/ollama-defaults.js";
 import {
   listConfigBackups,
   createConfigBackup,
   restoreConfigBackup,
   getBackupStats,
 } from "../config/config-backup-restore.js";
-import { OLLAMA_DEFAULT_BASE_URL } from "../agents/ollama-defaults.js";
 import { readConfigFileSnapshot, writeConfigFile } from "../config/config.js";
 import { formatConfigIssueLines, normalizeConfigIssues } from "../config/issue-format.js";
 import { CONFIG_PATH } from "../config/paths.js";
@@ -27,6 +27,7 @@ type ConfigSetParseOpts = {
 
 const OLLAMA_API_KEY_PATH: PathSegment[] = ["models", "providers", "ollama", "apiKey"];
 const OLLAMA_PROVIDER_PATH: PathSegment[] = ["models", "providers", "ollama"];
+const OLLAMA_DEFAULT_BASE_URL = "http://127.0.0.1:11434";
 
 function isIndexSegment(raw: string): boolean {
   return /^[0-9]+$/.test(raw);
@@ -145,3 +146,506 @@ function getAtPath(root: unknown, path: PathSegment[]): { found: boolean; value?
 
 function setAtPath(root: Record<string, unknown>, path: PathSegment[], value: unknown): void {
   let current: unknown = root;
+  for (let i = 0; i < path.length - 1; i += 1) {
+    const segment = path[i];
+    const next = path[i + 1];
+    const nextIsIndex = Boolean(next && isIndexSegment(next));
+    if (Array.isArray(current)) {
+      if (!isIndexSegment(segment)) {
+        throw new Error(`Expected numeric index for array segment "${segment}"`);
+      }
+      const index = Number.parseInt(segment, 10);
+      const existing = current[index];
+      if (!existing || typeof existing !== "object") {
+        current[index] = nextIsIndex ? [] : {};
+      }
+      current = current[index];
+      continue;
+    }
+    if (!current || typeof current !== "object") {
+      throw new Error(`Cannot traverse into "${segment}" (not an object)`);
+    }
+    const record = current as Record<string, unknown>;
+    const existing = hasOwnPathKey(record, segment) ? record[segment] : undefined;
+    if (!existing || typeof existing !== "object") {
+      record[segment] = nextIsIndex ? [] : {};
+    }
+    current = record[segment];
+  }
+
+  const last = path[path.length - 1];
+  if (Array.isArray(current)) {
+    if (!isIndexSegment(last)) {
+      throw new Error(`Expected numeric index for array segment "${last}"`);
+    }
+    const index = Number.parseInt(last, 10);
+    current[index] = value;
+    return;
+  }
+  if (!current || typeof current !== "object") {
+    throw new Error(`Cannot set "${last}" (parent is not an object)`);
+  }
+  (current as Record<string, unknown>)[last] = value;
+}
+
+function unsetAtPath(root: Record<string, unknown>, path: PathSegment[]): boolean {
+  let current: unknown = root;
+  for (let i = 0; i < path.length - 1; i += 1) {
+    const segment = path[i];
+    if (!current || typeof current !== "object") {
+      return false;
+    }
+    if (Array.isArray(current)) {
+      if (!isIndexSegment(segment)) {
+        return false;
+      }
+      const index = Number.parseInt(segment, 10);
+      if (!Number.isFinite(index) || index < 0 || index >= current.length) {
+        return false;
+      }
+      current = current[index];
+      continue;
+    }
+    const record = current as Record<string, unknown>;
+    if (!hasOwnPathKey(record, segment)) {
+      return false;
+    }
+    current = record[segment];
+  }
+
+  const last = path[path.length - 1];
+  if (Array.isArray(current)) {
+    if (!isIndexSegment(last)) {
+      return false;
+    }
+    const index = Number.parseInt(last, 10);
+    if (!Number.isFinite(index) || index < 0 || index >= current.length) {
+      return false;
+    }
+    current.splice(index, 1);
+    return true;
+  }
+  if (!current || typeof current !== "object") {
+    return false;
+  }
+  const record = current as Record<string, unknown>;
+  if (!hasOwnPathKey(record, last)) {
+    return false;
+  }
+  delete record[last];
+  return true;
+}
+
+async function loadValidConfig(runtime: RuntimeEnv = defaultRuntime) {
+  const snapshot = await readConfigFileSnapshot();
+  if (snapshot.valid) {
+    return snapshot;
+  }
+  runtime.error(`Config invalid at ${shortenHomePath(snapshot.path)}.`);
+  for (const line of formatConfigIssueLines(snapshot.issues, "-", { normalizeRoot: true })) {
+    runtime.error(line);
+  }
+  runtime.error(formatDoctorHint("to repair, then retry."));
+  runtime.exit(1);
+  return snapshot;
+}
+
+function parseRequiredPath(path: string): PathSegment[] {
+  const parsedPath = parsePath(path);
+  if (parsedPath.length === 0) {
+    throw new Error("Path is empty.");
+  }
+  validatePathSegments(parsedPath);
+  return parsedPath;
+}
+
+function pathEquals(path: PathSegment[], expected: PathSegment[]): boolean {
+  return (
+    path.length === expected.length && path.every((segment, index) => segment === expected[index])
+  );
+}
+
+function ensureValidOllamaProviderForApiKeySet(
+  root: Record<string, unknown>,
+  path: PathSegment[],
+): void {
+  if (!pathEquals(path, OLLAMA_API_KEY_PATH)) {
+    return;
+  }
+  const existing = getAtPath(root, OLLAMA_PROVIDER_PATH);
+  if (existing.found) {
+    return;
+  }
+  setAtPath(root, OLLAMA_PROVIDER_PATH, {
+    baseUrl: OLLAMA_DEFAULT_BASE_URL,
+    api: "ollama",
+    models: [],
+  });
+}
+
+export async function runConfigGet(opts: { path: string; json?: boolean; runtime?: RuntimeEnv }) {
+  const runtime = opts.runtime ?? defaultRuntime;
+  try {
+    const parsedPath = parseRequiredPath(opts.path);
+    const snapshot = await loadValidConfig(runtime);
+    const redacted = redactConfigObject(snapshot.config);
+    const res = getAtPath(redacted, parsedPath);
+    if (!res.found) {
+      runtime.error(danger(`Config path not found: ${opts.path}`));
+      runtime.exit(1);
+      return;
+    }
+    if (opts.json) {
+      runtime.log(JSON.stringify(res.value ?? null, null, 2));
+      return;
+    }
+    if (
+      typeof res.value === "string" ||
+      typeof res.value === "number" ||
+      typeof res.value === "boolean"
+    ) {
+      runtime.log(String(res.value));
+      return;
+    }
+    runtime.log(JSON.stringify(res.value ?? null, null, 2));
+  } catch (err) {
+    runtime.error(danger(String(err)));
+    runtime.exit(1);
+  }
+}
+
+export async function runConfigUnset(opts: { path: string; runtime?: RuntimeEnv }) {
+  const runtime = opts.runtime ?? defaultRuntime;
+  try {
+    const parsedPath = parseRequiredPath(opts.path);
+    const snapshot = await loadValidConfig(runtime);
+    // Use snapshot.resolved (config after $include and ${ENV} resolution, but BEFORE runtime defaults)
+    // instead of snapshot.config (runtime-merged with defaults).
+    // This prevents runtime defaults from leaking into the written config file (issue #6070)
+    const next = structuredClone(snapshot.resolved) as Record<string, unknown>;
+    const removed = unsetAtPath(next, parsedPath);
+    if (!removed) {
+      runtime.error(danger(`Config path not found: ${opts.path}`));
+      runtime.exit(1);
+      return;
+    }
+    await writeConfigFile(next, { unsetPaths: [parsedPath] });
+    runtime.log(info(`Removed ${opts.path}. Restart the gateway to apply.`));
+  } catch (err) {
+    runtime.error(danger(String(err)));
+    runtime.exit(1);
+  }
+}
+
+export async function runConfigFile(opts: { runtime?: RuntimeEnv }) {
+  const runtime = opts.runtime ?? defaultRuntime;
+  try {
+    const snapshot = await readConfigFileSnapshot();
+    runtime.log(shortenHomePath(snapshot.path));
+  } catch (err) {
+    runtime.error(danger(String(err)));
+    runtime.exit(1);
+  }
+}
+
+export async function runConfigValidate(opts: { json?: boolean; runtime?: RuntimeEnv } = {}) {
+  const runtime = opts.runtime ?? defaultRuntime;
+  let outputPath = CONFIG_PATH ?? "openclaw.json";
+
+  try {
+    const snapshot = await readConfigFileSnapshot();
+    outputPath = snapshot.path;
+    const shortPath = shortenHomePath(outputPath);
+
+    if (!snapshot.exists) {
+      if (opts.json) {
+        runtime.log(JSON.stringify({ valid: false, path: outputPath, error: "file not found" }));
+      } else {
+        runtime.error(danger(`Config file not found: ${shortPath}`));
+      }
+      runtime.exit(1);
+      return;
+    }
+
+    if (!snapshot.valid) {
+      const issues = normalizeConfigIssues(snapshot.issues);
+
+      if (opts.json) {
+        runtime.log(JSON.stringify({ valid: false, path: outputPath, issues }, null, 2));
+      } else {
+        runtime.error(danger(`Config invalid at ${shortPath}:`));
+        for (const line of formatConfigIssueLines(issues, danger("×"), { normalizeRoot: true })) {
+          runtime.error(`  ${line}`);
+        }
+        runtime.error("");
+        runtime.error(formatDoctorHint("to repair, or fix the keys above manually."));
+      }
+      runtime.exit(1);
+      return;
+    }
+
+    if (opts.json) {
+      runtime.log(JSON.stringify({ valid: true, path: outputPath }));
+    } else {
+      runtime.log(success(`Config valid: ${shortPath}`));
+    }
+  } catch (err) {
+    if (opts.json) {
+      runtime.log(JSON.stringify({ valid: false, path: outputPath, error: String(err) }));
+    } else {
+      runtime.error(danger(`Config validation error: ${String(err)}`));
+    }
+    runtime.exit(1);
+  }
+}
+
+export function registerConfigCli(program: Command) {
+  const cmd = program
+    .command("config")
+    .description(
+      "Non-interactive config helpers (get/set/unset/file/validate). Run without subcommand for the setup wizard.",
+    )
+    .addHelpText(
+      "after",
+      () =>
+        `\n${theme.muted("Docs:")} ${formatDocsLink("/cli/config", "docs.openclaw.ai/cli/config")}\n`,
+    )
+    .option(
+      "--section <section>",
+      "Configure wizard sections (repeatable). Use with no subcommand.",
+      (value: string, previous: string[]) => [...previous, value],
+      [] as string[],
+    )
+    .action(async (opts) => {
+      const { configureCommandFromSectionsArg } = await import("../commands/configure.js");
+      await configureCommandFromSectionsArg(opts.section, defaultRuntime);
+    });
+
+  cmd
+    .command("get")
+    .description("Get a config value by dot path")
+    .argument("<path>", "Config path (dot or bracket notation)")
+    .option("--json", "Output JSON", false)
+    .action(async (path: string, opts) => {
+      await runConfigGet({ path, json: Boolean(opts.json) });
+    });
+
+  cmd
+    .command("set")
+    .description("Set a config value by dot path")
+    .argument("<path>", "Config path (dot or bracket notation)")
+    .argument("<value>", "Value (JSON5 or raw string)")
+    .option("--strict-json", "Strict JSON5 parsing (error instead of raw string fallback)", false)
+    .option("--json", "Legacy alias for --strict-json", false)
+    .action(async (path: string, value: string, opts) => {
+      try {
+        const parsedPath = parseRequiredPath(path);
+        const parsedValue = parseValue(value, {
+          strictJson: Boolean(opts.strictJson || opts.json),
+        });
+        const snapshot = await loadValidConfig();
+        // Use snapshot.resolved (config after $include and ${ENV} resolution, but BEFORE runtime defaults)
+        // instead of snapshot.config (runtime-merged with defaults).
+        // This prevents runtime defaults from leaking into the written config file (issue #6070)
+        const next = structuredClone(snapshot.resolved) as Record<string, unknown>;
+        ensureValidOllamaProviderForApiKeySet(next, parsedPath);
+        setAtPath(next, parsedPath, parsedValue);
+        await writeConfigFile(next);
+        defaultRuntime.log(info(`Updated ${path}. Restart the gateway to apply.`));
+      } catch (err) {
+        defaultRuntime.error(danger(String(err)));
+        defaultRuntime.exit(1);
+      }
+    });
+
+  cmd
+    .command("unset")
+    .description("Remove a config value by dot path")
+    .argument("<path>", "Config path (dot or bracket notation)")
+    .action(async (path: string) => {
+      await runConfigUnset({ path });
+    });
+
+  cmd
+    .command("file")
+    .description("Print the active config file path")
+    .action(async () => {
+      await runConfigFile({});
+    });
+
+  cmd
+    .command("validate")
+    .description("Validate the current config against the schema without starting the gateway")
+    .option("--json", "Output validation result as JSON", false)
+    .action(async (opts) => {
+      await runConfigValidate({ json: Boolean(opts.json) });
+    });
+
+  cmd
+    .command("backup")
+    .description("Create a manual backup of the current config")
+    .option("--label <label>", "Optional label for the backup")
+    .action(async (opts) => {
+      await runConfigBackup({ label: opts.label });
+    });
+
+  cmd
+    .command("restore")
+    .description("Restore config from a backup")
+    .option("--last", "Restore from the most recent backup", false)
+    .option("--backup-path <path>", "Path to specific backup file")
+    .option("--dry-run", "Show what would be restored without making changes", false)
+    .action(async (opts) => {
+      await runConfigRestore({
+        last: Boolean(opts.last),
+        backupPath: opts.backupPath,
+        dryRun: Boolean(opts.dryRun),
+      });
+    });
+
+  cmd
+    .command("list-backups")
+    .description("List available config backups with statistics")
+    .option("--json", "Output as JSON", false)
+    .action(async (opts) => {
+      await runConfigListBackups({ json: Boolean(opts.json) });
+    });
+}
+
+async function runConfigBackup(opts: { label?: string }) {
+  const runtime = defaultRuntime;
+  try {
+    const snapshot = await readConfigFileSnapshot();
+    if (!snapshot.exists) {
+      runtime.error(danger(`Config file not found: ${shortenHomePath(snapshot.path)}`));
+      runtime.exit(1);
+      return;
+    }
+
+    const backup = await createConfigBackup(snapshot.path, {
+      timestamp: true,
+      label: opts.label,
+    });
+
+    runtime.log(success(`Created backup: ${shortenHomePath(backup.path)}`));
+    runtime.log(theme.muted(`  Size: ${backup.size} bytes`));
+    runtime.log(theme.muted(`  Timestamp: ${backup.timestamp.toISOString()}`));
+  } catch (err) {
+    runtime.error(danger(String(err)));
+    runtime.exit(1);
+  }
+}
+
+async function runConfigRestore(opts: { last?: boolean; backupPath?: string; dryRun?: boolean }) {
+  const runtime = defaultRuntime;
+  try {
+    const snapshot = await readConfigFileSnapshot();
+
+    if (opts.backupPath) {
+      const result = await restoreConfigBackup(snapshot.path, {
+        backupPath: opts.backupPath,
+        dryRun: opts.dryRun,
+      });
+
+      if (result.success) {
+        if (opts.dryRun) {
+          runtime.log(info(`Would restore from: ${shortenHomePath(result.backupPath)}`));
+        } else {
+          runtime.log(success(`Restored config from: ${shortenHomePath(result.backupPath)}`));
+          runtime.log(theme.muted("Restart the gateway to apply the restored config."));
+        }
+      } else {
+        runtime.error(danger(`Failed to restore: ${result.error}`));
+        runtime.exit(1);
+      }
+      return;
+    }
+
+    // Default to --last if no backup path specified
+    const backups = await listConfigBackups(snapshot.path);
+    if (backups.length === 0) {
+      runtime.error(danger("No backups found."));
+      runtime.exit(1);
+      return;
+    }
+
+    // Use the most recent backup (first in sorted list)
+    const latestBackup = backups[0];
+    const result = await restoreConfigBackup(snapshot.path, {
+      backupPath: latestBackup.path,
+      dryRun: opts.dryRun,
+    });
+
+    if (result.success) {
+      if (opts.dryRun) {
+        runtime.log(info(`Would restore from: ${shortenHomePath(result.backupPath)}`));
+      } else {
+        runtime.log(success(`Restored config from: ${shortenHomePath(result.backupPath)}`));
+        runtime.log(theme.muted("Restart the gateway to apply the restored config."));
+      }
+    } else {
+      runtime.error(danger(`Failed to restore: ${result.error}`));
+      runtime.exit(1);
+    }
+  } catch (err) {
+    runtime.error(danger(String(err)));
+    runtime.exit(1);
+  }
+}
+
+async function runConfigListBackups(opts: { json?: boolean }) {
+  const runtime = defaultRuntime;
+  try {
+    const snapshot = await readConfigFileSnapshot();
+    const backups = await listConfigBackups(snapshot.path);
+    const stats = await getBackupStats(snapshot.path);
+
+    if (opts.json) {
+      runtime.log(
+        JSON.stringify(
+          {
+            configPath: snapshot.path,
+            backups: backups.map((b) => ({
+              path: b.path,
+              timestamp: b.timestamp.toISOString(),
+              size: b.size,
+              label: b.label,
+            })),
+            stats: {
+              totalBackups: stats.totalBackups,
+              totalSize: stats.totalSize,
+              oldestBackup: stats.oldestBackup?.toISOString(),
+              newestBackup: stats.newestBackup?.toISOString(),
+            },
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+
+    if (backups.length === 0) {
+      runtime.log(info("No backups found."));
+      return;
+    }
+
+    runtime.log(theme.bold(`Config backups for ${shortenHomePath(snapshot.path)}:`));
+    runtime.log("");
+    for (const backup of backups) {
+      const label = backup.label ? ` (${backup.label})` : "";
+      const size = backup.size < 1024 ? `${backup.size}B` : `${(backup.size / 1024).toFixed(1)}KB`;
+      runtime.log(`  ${shortenHomePath(backup.path)}${label}`);
+      runtime.log(theme.muted(`    ${backup.timestamp.toISOString()} · ${size}`));
+    }
+    runtime.log("");
+    runtime.log(
+      theme.muted(
+        `Total: ${stats.totalBackups} backup(s), ${stats.totalSize < 1024 ? `${stats.totalSize}B` : `${(stats.totalSize / 1024).toFixed(1)}KB`}`,
+      ),
+    );
+  } catch (err) {
+    runtime.error(danger(String(err)));
+    runtime.exit(1);
+  }
+}
