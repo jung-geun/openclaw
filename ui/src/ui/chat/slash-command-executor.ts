@@ -132,10 +132,12 @@ async function executeModel(
 ): Promise<SlashCommandResult> {
   if (!args) {
     try {
-      const sessions = await client.request<SessionsListResult>("sessions.list", {});
+      const [sessions, models] = await Promise.all([
+        client.request<SessionsListResult>("sessions.list", {}),
+        client.request<{ models: ModelCatalogEntry[] }>("models.list", {}),
+      ]);
       const session = sessions?.sessions?.find((s: GatewaySessionRow) => s.key === sessionKey);
       const model = session?.model || sessions?.defaults?.model || "default";
-      const models = await client.request<{ models: ModelCatalogEntry[] }>("models.list", {});
       const available = models?.models?.map((m: ModelCatalogEntry) => m.id) ?? [];
       const lines = [`**Current model:** \`${model}\``];
       if (available.length > 0) {
@@ -303,6 +305,13 @@ async function executeKill(
         entry.status === "fulfilled" && (entry.value as { aborted?: boolean })?.aborted !== false,
     ).length;
     if (successCount === 0) {
+      const failedCount = results.filter((e) => e.status === "rejected").length;
+      const idleCount = matched.length - failedCount;
+      if (idleCount > 0) {
+        return {
+          content: `No active runs to abort — ${idleCount} session${idleCount === 1 ? " is" : "s are"} idle.`,
+        };
+      }
       const firstFailure = results.find((entry) => entry.status === "rejected");
       throw firstFailure?.reason ?? new Error("abort failed");
     }
@@ -351,13 +360,10 @@ function resolveKillTargets(
       currentParsed?.agentId != null && parsed?.agentId === currentParsed.agentId;
     const isMatch =
       (normalizedTarget === "all" && isInCurrentTree) ||
-      normalizedKey === normalizedTarget ||
-      (parsed?.agentId ?? "") === normalizedTarget ||
-      normalizedKey.endsWith(`:subagent:${normalizedTarget}`) ||
-      normalizedKey === `subagent:${normalizedTarget}` ||
-      (currentParsed?.agentId != null &&
-        parsed?.agentId === currentParsed.agentId &&
-        normalizedKey.endsWith(`:subagent:${normalizedTarget}`));
+      (isInCurrentTree && normalizedKey === normalizedTarget) ||
+      (isInCurrentTree && (parsed?.agentId ?? "") === normalizedTarget) ||
+      (isInCurrentTree && normalizedKey.endsWith(`:subagent:${normalizedTarget}`)) ||
+      (isInCurrentTree && normalizedKey === `subagent:${normalizedTarget}`);
     if (isMatch) {
       keys.add(key);
     }

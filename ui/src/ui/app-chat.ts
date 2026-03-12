@@ -170,6 +170,9 @@ async function flushChatQueue(host: ChatHost) {
   }
   if (!ok) {
     host.chatQueue = [next, ...host.chatQueue];
+  } else if (host.chatQueue.length > 0) {
+    // Continue draining — local commands don't block on server response
+    void flushChatQueue(host);
   }
 }
 
