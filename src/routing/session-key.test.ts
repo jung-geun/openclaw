@@ -148,6 +148,19 @@ describe("extractUserIdFromSessionKey", () => {
     );
   });
 
+  it("extracts full userId when userId contains colons", () => {
+    // International phone numbers with colons, composite IDs, etc.
+    expect(extractUserIdFromSessionKey("agent:main:whatsapp:direct:+1:555:123:4567")).toBe(
+      "+1:555:123:4567",
+    );
+    expect(extractUserIdFromSessionKey("agent:main:custom:direct:user:with:colons")).toBe(
+      "user:with:colons",
+    );
+    expect(extractUserIdFromSessionKey("agent:main:signal:account1:direct:+44:20:7946:0958")).toBe(
+      "+44:20:7946:0958",
+    );
+  });
+
   it("returns null for non-direct session keys", () => {
     expect(extractUserIdFromSessionKey("agent:main:main")).toBeNull();
     expect(extractUserIdFromSessionKey("agent:main:telegram:group:g1")).toBeNull();
