@@ -27,7 +27,6 @@ type ConfigSetParseOpts = {
 
 const OLLAMA_API_KEY_PATH: PathSegment[] = ["models", "providers", "ollama", "apiKey"];
 const OLLAMA_PROVIDER_PATH: PathSegment[] = ["models", "providers", "ollama"];
-const OLLAMA_DEFAULT_BASE_URL = "http://127.0.0.1:11434";
 
 function isIndexSegment(raw: string): boolean {
   return /^[0-9]+$/.test(raw);
